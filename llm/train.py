@@ -1,6 +1,5 @@
 import os
 import math
-import csv
 import torch
 import torch.nn as nn
 import torch.optim as optim
@@ -15,35 +14,36 @@ from tqdm import tqdm
 # 1) CONFIGURATION
 ###############################################################################
 BATCH_SIZE = 4
-BLOCK_SIZE = 128
+BLOCK_SIZE = 128   # Sequence length for each training example
 EMBED_DIM = 128
 NUM_HEADS = 2
 NUM_LAYERS = 2
 FFN_DIM = 512
 DROPOUT = 0.1
 LR = 3e-4
-EPOCHS = 50            # Train for 50 epochs as requested
-PRINT_EVERY = 100      # Steps between printing progress info
+EPOCHS = 1        # Increase for real training
+PRINT_EVERY = 100 # Steps between printing progress info
 DATASET_NAME = "wikitext"
-DATASET_CONFIG = "wikitext-103-v1"  # or "wikitext-2-v1" for a smaller test
-CSV_STATS_FILE = "training_stats.csv"
+DATASET_CONFIG = "wikitext-103-v1"  # or "wikitext-2-v1" for smaller dataset
 
 def main():
     ###############################################################################
     # 2) INITIALIZE DISTRIBUTED
     ###############################################################################
-    # This script is intended to be launched via:
-    #   torchrun --nproc_per_node=<NUM_GPUS> ddp_minimal_wikitext.py
+    # This script expects to be launched via:
+    #    torchrun --nproc_per_node=<NUM_GPUS> ddp_minimal_wikitext.py
+    #
+    # We do NOT manually spawn processes. Instead, we read the environment variables
+    # set by torchrun to initialize the distributed process group.
 
-    dist.init_process_group(backend="nccl")
-    local_rank = int(os.environ["LOCAL_RANK"])
+    dist.init_process_group(backend="nccl")  # For GPU-based training, typically NCCL
+    local_rank = int(os.environ["LOCAL_RANK"])  # which GPU on this node
     torch.cuda.set_device(local_rank)
     global_rank = dist.get_rank()
     world_size = dist.get_world_size()
-
+    
     device = torch.device("cuda", local_rank)
 
-    # Only rank 0 prints some info
     if global_rank == 0:
         print("==========================================")
         print(f" World size: {world_size}")
@@ -51,20 +51,23 @@ def main():
         print("==========================================")
 
     ###############################################################################
-    # 3) LOAD & PREPARE DATASET
+    # 3) LOAD & PREPARE THE DATASET (only on rank 0, then broadcast if desired)
     ###############################################################################
-    # Each process downloads and processes the dataset for simplicity.
-    # For large-scale setups, you might only load it once on rank 0 and scatter,
-    # but that adds complexity.
+    # For large datasets, you might want to only load data on rank 0 then distribute
+    # to other ranks. For simplicity, each rank will download + load the dataset here.
+    # This can be less efficient but simpler for demonstration.
 
     if global_rank == 0:
         print(f"Loading dataset {DATASET_NAME}/{DATASET_CONFIG}...")
 
     dataset = load_dataset(DATASET_NAME, DATASET_CONFIG, split="train")
-
+    
+    # Use a GPT-2 tokenizer for subword tokenization out-of-the-box.
     tokenizer = AutoTokenizer.from_pretrained("gpt2")
-    tokenizer.pad_token = tokenizer.eos_token  # Re-use EOS token as pad
+    # GPT2 tokenizer doesn't define a pad token, so re-use eos_token for padding:
+    tokenizer.pad_token = tokenizer.eos_token
 
+    # Tokenize function
     def tokenize_function(examples):
         return tokenizer(examples["text"], return_special_tokens_mask=True)
 
@@ -74,19 +77,19 @@ def main():
         remove_columns=["text"],
     )
 
-    # Concatenate token IDs into one long stream
+    # Concatenate all tokens into a single list (continuous stream).
     all_ids = []
     for row in tokenized_dataset:
         all_ids.extend(row["input_ids"])
 
-    # Chunk into BLOCK_SIZE
+    # Create contiguous blocks (chunks) of size BLOCK_SIZE from the token stream.
     def chunkify(lst, chunk_size):
         for i in range(0, len(lst) - chunk_size + 1, chunk_size):
             yield lst[i:i + chunk_size]
 
     chunks = list(chunkify(all_ids, BLOCK_SIZE))
 
-    # Custom dataset
+    # Simple custom dataset for language modeling
     class WikiTextDataset(Dataset):
         def __init__(self, token_chunks):
             super().__init__()
@@ -96,124 +99,26 @@ def main():
             return len(self.token_chunks)
 
         def __getitem__(self, idx):
-            return torch.tensor(self.token_chunks[idx], dtype=torch.long)
+            input_ids = self.token_chunks[idx]
+            return torch.tensor(input_ids, dtype=torch.long)
 
     train_dataset = WikiTextDataset(chunks)
 
-    # DistributedSampler ensures each rank sees a unique subset
+    # Use DistributedSampler to split data among processes
     train_sampler = DistributedSampler(train_dataset)
 
+    # If you use multiple nodes, pin_memory can be set to True if local_rank uses GPU
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         sampler=train_sampler,
-        pin_memory=True
+        pin_memory=True,
     )
 
+    from model import SimpleTransformerLM  # Import your model here
+    
     ###############################################################################
-    # 4) DEFINE MODEL
-    ###############################################################################
-    class ScaledDotProductAttention(nn.Module):
-        def forward(self, Q, K, V, mask=None):
-            d_k = Q.size(-1)
-            scores = torch.matmul(Q, K.transpose(-2, -1)) / math.sqrt(d_k)
-            if mask is not None:
-                scores = scores.masked_fill(mask == 0, float('-inf'))
-            attn_weights = torch.softmax(scores, dim=-1)
-            output = torch.matmul(attn_weights, V)
-            return output, attn_weights
-
-    class MultiHeadAttention(nn.Module):
-        def __init__(self, embed_dim, num_heads, dropout=0.1):
-            super().__init__()
-            self.num_heads = num_heads
-            self.head_dim = embed_dim // num_heads
-
-            self.Q_proj = nn.Linear(embed_dim, embed_dim)
-            self.K_proj = nn.Linear(embed_dim, embed_dim)
-            self.V_proj = nn.Linear(embed_dim, embed_dim)
-            self.out_proj = nn.Linear(embed_dim, embed_dim)
-            self.attention = ScaledDotProductAttention()
-            self.dropout = nn.Dropout(dropout)
-
-        def forward(self, x, mask=None):
-            B, T, E = x.size()
-            Q = self.Q_proj(x)
-            K = self.K_proj(x)
-            V = self.V_proj(x)
-
-            # Reshape to (B, num_heads, T, head_dim)
-            Q = Q.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-            K = K.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-            V = V.view(B, T, self.num_heads, self.head_dim).transpose(1, 2)
-
-            out, _ = self.attention(Q, K, V, mask=mask)
-            out = out.transpose(1, 2).contiguous().view(B, T, E)
-            out = self.out_proj(out)
-            out = self.dropout(out)
-            return out
-
-    class TransformerBlock(nn.Module):
-        def __init__(self, embed_dim, num_heads, ffn_dim, dropout=0.1):
-            super().__init__()
-            self.attn = MultiHeadAttention(embed_dim, num_heads, dropout)
-            self.ln1 = nn.LayerNorm(embed_dim)
-            self.ffn = nn.Sequential(
-                nn.Linear(embed_dim, ffn_dim),
-                nn.ReLU(),
-                nn.Linear(ffn_dim, embed_dim),
-                nn.Dropout(dropout)
-            )
-            self.ln2 = nn.LayerNorm(embed_dim)
-
-        def forward(self, x, mask=None):
-            attn_out = self.attn(x, mask=mask)
-            x = self.ln1(x + attn_out)
-            ffn_out = self.ffn(x)
-            x = self.ln2(x + ffn_out)
-            return x
-
-    class SimpleTransformerLM(nn.Module):
-        def __init__(self, vocab_size, embed_dim, num_heads, num_layers, ffn_dim, dropout=0.1, block_size=128):
-            super().__init__()
-            self.token_embed = nn.Embedding(vocab_size, embed_dim)
-            self.pos_embed = nn.Embedding(block_size, embed_dim)
-            self.layers = nn.ModuleList([
-                TransformerBlock(embed_dim, num_heads, ffn_dim, dropout) for _ in range(num_layers)
-            ])
-            self.ln_final = nn.LayerNorm(embed_dim)
-            self.head = nn.Linear(embed_dim, vocab_size, bias=False)
-            self.block_size = block_size
-
-        def forward(self, idx, targets=None):
-            B, T = idx.size()
-            positions = torch.arange(0, T, device=idx.device).unsqueeze(0)  # (1, T)
-            tok_emb = self.token_embed(idx)
-            pos_emb = self.pos_embed(positions)
-            x = tok_emb + pos_emb
-
-            # Causal mask
-            mask = torch.ones((T, T), device=x.device).tril()
-            mask = mask.unsqueeze(0).unsqueeze(0)
-
-            for layer in self.layers:
-                x = layer(x, mask=mask)
-
-            x = self.ln_final(x)
-            logits = self.head(x)  # (B, T, vocab_size)
-
-            if targets is None:
-                return logits, None
-            else:
-                # next-token prediction
-                logits = logits[:, :-1, :].contiguous()
-                targets = targets[:, 1:].contiguous()
-                loss = nn.CrossEntropyLoss()(logits.view(-1, logits.size(-1)),
-                                             targets.view(-1))
-                return logits, loss
-
-    ###############################################################################
-    # 5) INIT MODEL & OPTIMIZER (DDP)
+    # 5) INITIALIZE MODEL & OPTIMIZER (DDP)
     ###############################################################################
     vocab_size = tokenizer.vocab_size
     model = SimpleTransformerLM(
@@ -226,28 +131,20 @@ def main():
         block_size=BLOCK_SIZE
     ).to(device)
 
+    # Wrap model with DistributedDataParallel
     model = DDP(model, device_ids=[local_rank], output_device=local_rank)
 
     optimizer = optim.AdamW(model.parameters(), lr=LR)
 
     ###############################################################################
-    # 6) PREPARE CSV STATS FILE (RANK 0)
-    ###############################################################################
-    if global_rank == 0:
-        # If file doesn't exist, write the header
-        if not os.path.exists(CSV_STATS_FILE):
-            with open(CSV_STATS_FILE, 'w', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow(["epoch", "train_loss", "train_ppl"])
-
-    ###############################################################################
-    # 7) TRAINING LOOP
+    # 6) TRAINING LOOP
     ###############################################################################
     model.train()
     for epoch in range(EPOCHS):
-        # set_epoch for DistributedSampler to shuffle differently each epoch
+        # Set the epoch for the DistributedSampler so it shuffles differently each epoch
         train_sampler.set_epoch(epoch)
 
+        # Only rank 0 will display a progress bar
         if global_rank == 0:
             progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
         else:
@@ -268,27 +165,16 @@ def main():
                 avg_loss = total_loss / (step + 1)
                 progress_bar.set_postfix({"loss": f"{avg_loss:.4f}"})
 
-        # Synchronize and compute global average loss across all ranks
-        total_loss_tensor = torch.tensor(total_loss, dtype=torch.float, device=device)
-        dist.all_reduce(total_loss_tensor, op=dist.ReduceOp.SUM)
-        # total_loss_tensor now is the SUM of losses from all ranks
+        # Compute average loss across all processes
+        avg_epoch_loss = total_loss / len(train_loader)
 
-        # Each rank runs the same number of steps, so total steps = len(train_loader)
-        # total_loss_tensor / (len(train_loader)*world_size) => global average
-        global_loss_sum = total_loss_tensor.item()
-        global_avg_loss = global_loss_sum / (len(train_loader) * world_size)
-        train_ppl = math.exp(global_avg_loss)
-
-        # Rank 0 logs to CSV
+        # Optionally, gather loss from all ranks and average. 
+        # For simplicity, we just print the rank 0 average.
         if global_rank == 0:
-            with open(CSV_STATS_FILE, 'a', newline='') as f:
-                writer = csv.writer(f)
-                writer.writerow([epoch+1, global_avg_loss, train_ppl])
-
-            print(f"[Rank 0] End of epoch {epoch+1}: avg_loss={global_avg_loss:.4f} ppl={train_ppl:.2f}")
+            print(f"[Rank 0] End of epoch {epoch+1}, average loss: {avg_epoch_loss:.4f}")
 
     ###############################################################################
-    # 8) SAMPLE GENERATION (OPTIONAL) - rank 0
+    # 7) SAMPLE GENERATION (OPTIONAL) - only rank 0
     ###############################################################################
     if global_rank == 0:
         def generate(model, start_tokens, max_new_tokens=50):
@@ -310,6 +196,7 @@ def main():
         generated_tokens = generate(model, start_tokens=encoded_prompt[0], max_new_tokens=20)
         print("Generated text:", tokenizer.decode(generated_tokens))
 
+    # Finalize DDP
     dist.destroy_process_group()
 
 if __name__ == "__main__":
