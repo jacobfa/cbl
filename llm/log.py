@@ -1,5 +1,6 @@
 import os
 import time
+import statistics
 import torch
 import torch.nn as nn
 from thop import profile
@@ -11,7 +12,7 @@ import cfl_model
 
 # ---------------------------------------------------------------------------
 # ModelWrapper: Wraps a model so that forward() returns only logits.
-# This is necessary for FLOPs counting.
+# This is necessary for FLOPs counting with THOP.
 # ---------------------------------------------------------------------------
 class ModelWrapper(nn.Module):
     def __init__(self, model_instance):
@@ -23,31 +24,43 @@ class ModelWrapper(nn.Module):
         return logits
 
 # ---------------------------------------------------------------------------
-# Measures forward-pass latency.
+# Measures forward-pass latency over multiple runs and computes average & std.
 # ---------------------------------------------------------------------------
 def measure_latency(model: nn.Module, inputs, warmup=2, reps=10):
+    """
+    Run 'warmup' forward passes (not timed), then measure the latency for
+    'reps' forward passes (timed individually). Return average & std dev.
+    """
     model.eval()
+    latencies = []
+
     with torch.no_grad():
+        # Warmup
         for _ in range(warmup):
             _ = model(*inputs)
-        start = time.time()
+
+        # Timed runs
         for _ in range(reps):
+            start_iter = time.time()
             _ = model(*inputs)
-        end = time.time()
-    avg_latency = (end - start) / reps
-    return avg_latency
+            end_iter = time.time()
+            latencies.append(end_iter - start_iter)
+
+    avg_latency = statistics.mean(latencies)
+    std_latency = statistics.stdev(latencies) if len(latencies) > 1 else 0.0
+
+    return avg_latency, std_latency
 
 # ---------------------------------------------------------------------------
 # Computes FLOPs and parameter count using THOP.
 # Returns FLOPs in billions (B FLOPs) and parameter count.
 # ---------------------------------------------------------------------------
 def get_flops_and_params_thop(model: nn.Module, vocab_size=30522, seq_len=32, device='cpu'):
+    """
+    Wrap the model so only the logits are returned (required by THOP),
+    build a dummy input of size (1, seq_len), and measure FLOPs & params.
+    """
     wrapped_model = ModelWrapper(model).to(device)
-
-    def my_input_constructor(input_res):
-        # Create a dummy input tensor on the specified device
-        dummy_idx = torch.randint(0, vocab_size, (1, input_res[0])).to(device)
-        return {"x": dummy_idx}
 
     try:
         flops, params = profile(
@@ -59,7 +72,7 @@ def get_flops_and_params_thop(model: nn.Module, vocab_size=30522, seq_len=32, de
         print("Flops estimation failed with exception:", e)
         return None, None
 
-    # Convert FLOPs to billions:
+    # Convert FLOPs to billions
     flops_in_B = flops / 1e9
     return flops_in_B, params
 
@@ -67,7 +80,7 @@ def main():
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     # New, larger configurations to "greatly increase" layers & parameter sizes:
-    # Each tuple: (embed_dim, num_heads, num_layers, ffn_dim, seq_len)
+    # (embed_dim, num_heads, num_layers, ffn_dim, seq_len)
     configs = [
         (256, 8, 12, 2048, 64),
         (512, 8, 12, 4096, 128),
@@ -106,14 +119,22 @@ def main():
             flops_vanilla, params_vanilla = get_flops_and_params_thop(
                 vanilla_model, vocab_size=30522, seq_len=seq_len, device=device
             )
-            lat_vanilla = measure_latency(vanilla_model, inputs=(dummy_input_vanilla,), warmup=2, reps=10)
+            lat_vanilla, std_vanilla = measure_latency(
+                vanilla_model, inputs=(dummy_input_vanilla,), warmup=2, reps=10
+            )
 
             if flops_vanilla is not None and params_vanilla is not None:
                 param_million_vanilla = params_vanilla / 1e6
-                f.write(f"[Vanilla] Params: {param_million_vanilla:.3f} M, "
-                        f"FLOPs: {flops_vanilla:.2f} B, Latency: {lat_vanilla:.6f} s\n")
+                f.write(
+                    f"[Vanilla] Params: {param_million_vanilla:.3f} M, "
+                    f"FLOPs: {flops_vanilla:.2f} B, "
+                    f"Latency: {lat_vanilla:.6f} s (+/- {std_vanilla:.6f} s)\n"
+                )
             else:
-                f.write(f"[Vanilla] FLOPs estimation failed, Latency: {lat_vanilla:.6f} s\n")
+                f.write(
+                    f"[Vanilla] FLOPs estimation failed, "
+                    f"Latency: {lat_vanilla:.6f} s (+/- {std_vanilla:.6f} s)\n"
+                )
 
             # 2) CFL-augmented Transformer from cfl_model.py
             cfl_model_instance = cfl_model.SimpleTransformerLM(
@@ -132,14 +153,22 @@ def main():
             flops_cfl, params_cfl = get_flops_and_params_thop(
                 cfl_model_instance, vocab_size=30522, seq_len=seq_len, device=device
             )
-            lat_cfl = measure_latency(cfl_model_instance, inputs=(dummy_input_cfl,), warmup=2, reps=10)
+            lat_cfl, std_cfl = measure_latency(
+                cfl_model_instance, inputs=(dummy_input_cfl,), warmup=2, reps=10
+            )
 
             if flops_cfl is not None and params_cfl is not None:
                 param_million_cfl = params_cfl / 1e6
-                f.write(f"[CFL]     Params: {param_million_cfl:.3f} M, "
-                        f"FLOPs: {flops_cfl:.2f} B, Latency: {lat_cfl:.6f} s\n")
+                f.write(
+                    f"[CFL]     Params: {param_million_cfl:.3f} M, "
+                    f"FLOPs: {flops_cfl:.2f} B, "
+                    f"Latency: {lat_cfl:.6f} s (+/- {std_cfl:.6f} s)\n"
+                )
             else:
-                f.write(f"[CFL]     FLOPs estimation failed, Latency: {lat_cfl:.6f} s\n")
+                f.write(
+                    f"[CFL]     FLOPs estimation failed, "
+                    f"Latency: {lat_cfl:.6f} s (+/- {std_cfl:.6f} s)\n"
+                )
 
     print(f"Done. Results are in {log_filename}")
 
