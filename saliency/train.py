@@ -1,14 +1,14 @@
 import os
-import cv2  # for resizing patch-level attention maps (pip install opencv-python)
+import cv2  # for resizing patch-level attention maps
 import torch
 import torch.nn as nn
 import torch.optim as optim
 import torch.nn.functional as F
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
-
 from torch.utils.data import DataLoader, DistributedSampler
-from torchvision import datasets, transforms
+from torchvision import transforms
+from torchvision.datasets import ImageNet
 
 # For saliency (Captum)
 try:
@@ -20,25 +20,27 @@ except ImportError:
 import matplotlib.pyplot as plt
 import numpy as np
 import argparse
+from tqdm import tqdm
 
 
 # -----------------------------------------------------------------------------
 # 1. Data
 # -----------------------------------------------------------------------------
 def get_imagenet_loaders(
-    train_dir="/data/jacob/ImageNet/train",
-    val_dir="/data/jacob/ImageNet/val",
+    root="/data/jacob/ImageNet",
     batch_size=64,
     num_workers=4,
     distributed=False,
     world_size=1,
-    rank=0,
+    rank=0
 ):
     """
-    Returns train and validation DataLoaders for ImageNet with standard transforms.
-    Uses DistributedSampler if 'distributed=True'.
+    Returns train and validation DataLoaders for ImageNet with standard transforms,
+    using torchvision.datasets.ImageNet. Expects a directory structure:
+      /data/jacob/ImageNet/train/<class>/*.JPEG
+      /data/jacob/ImageNet/val/<class>/*.JPEG
     """
-    # Standard ImageNet normalization
+
     imagenet_mean = [0.485, 0.456, 0.406]
     imagenet_std  = [0.229, 0.224, 0.225]
 
@@ -55,11 +57,18 @@ def get_imagenet_loaders(
         transforms.Normalize(imagenet_mean, imagenet_std),
     ])
 
-    train_dataset = datasets.ImageFolder(train_dir, transform=transform_train)
-    val_dataset   = datasets.ImageFolder(val_dir,   transform=transform_val)
+    train_dataset = ImageNet(
+        root=root,
+        split='train',
+        transform=transform_train
+    )
+    val_dataset = ImageNet(
+        root=root,
+        split='val',
+        transform=transform_val
+    )
 
     if distributed:
-        # Each process has its own sampler, with a subset of the data
         train_sampler = DistributedSampler(
             train_dataset,
             num_replicas=world_size,
@@ -72,12 +81,11 @@ def get_imagenet_loaders(
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=(train_sampler is None),  # shuffle only if not distributed
+        shuffle=(train_sampler is None),
         num_workers=num_workers,
         pin_memory=True,
         sampler=train_sampler
     )
-    # For validation, we typically don't shuffle. We can skip distributed sampler or use it for consistent batch sizing.
     val_loader = DataLoader(
         val_dataset,
         batch_size=batch_size,
@@ -85,6 +93,7 @@ def get_imagenet_loaders(
         num_workers=num_workers,
         pin_memory=True
     )
+
     return train_loader, val_loader
 
 
@@ -92,10 +101,6 @@ def get_imagenet_loaders(
 # 2. TransformerEncoderLayerWithAttn
 # -----------------------------------------------------------------------------
 class TransformerEncoderLayerWithAttn(nn.Module):
-    """
-    A drop-in replacement for nn.TransformerEncoderLayer that always returns
-    (output, attn_weights) with 'need_weights=True'.
-    """
     def __init__(self, d_model, nhead, dim_feedforward=768, dropout=0.1,
                  activation="relu", batch_first=True):
         super().__init__()
@@ -137,10 +142,6 @@ class TransformerEncoderLayerWithAttn(nn.Module):
 # 3. Simple Vision Transformer
 # -----------------------------------------------------------------------------
 class PatchEmbed(nn.Module):
-    """
-    Splits an image of size 224x224 (typical for ImageNet) into non-overlapping patches.
-    E.g. patch_size=16 => 14x14=196 patches. Then projects them to embed_dim.
-    """
     def __init__(self, in_chans=3, patch_size=16, embed_dim=192, img_size=224):
         super().__init__()
         self.patch_size = patch_size
@@ -155,18 +156,14 @@ class PatchEmbed(nn.Module):
         )
 
     def forward(self, x):
-        # x: (B, 3, 224, 224)
         out = self.proj(x)  # (B, embed_dim, H/patch, W/patch)
-        B, E, H, W = out.shape  # e.g. H=W=14 if patch_size=16
-        out = out.flatten(2)    # (B, E, H*W)
-        out = out.transpose(1, 2)  # (B, H*W, E)
+        B, E, H, W = out.shape
+        out = out.flatten(2)      # (B, E, H*W)
+        out = out.transpose(1, 2) # (B, H*W, E)
         return out
 
 
 class SimpleTransformerEncoder(nn.Module):
-    """
-    A minimal TransformerEncoder for ImageNet classification.
-    """
     def __init__(self, embed_dim=192, num_heads=4, num_layers=4,
                  num_classes=1000, seq_len=196, dim_feedforward=768, dropout=0.1):
         super().__init__()
@@ -210,10 +207,6 @@ class SimpleTransformerEncoder(nn.Module):
 # 4. CFL (Contextual Feedback Loops)
 # -----------------------------------------------------------------------------
 class FeedbackAdapter(nn.Module):
-    """
-    Simple gating-based feedback:
-    h_{t+1} = sigma(W_g z_t) * h_t
-    """
     def __init__(self, embed_dim, context_dim):
         super().__init__()
         self.gate = nn.Linear(context_dim, embed_dim)
@@ -226,9 +219,8 @@ class FeedbackAdapter(nn.Module):
 
 class CFLTransformer(nn.Module):
     """
-    Wrap the base Vision Transformer with:
-      - a projector g() to map final outputs -> context
-      - a feedback adapter for iterative refinements
+    Minimal Vision Transformer with a gating-based feedback loop.
+    Hard-coded num_classes=1000 for standard ImageNet-1k.
     """
     def __init__(self, patch_size=16, embed_dim=192, num_heads=4, num_layers=4,
                  num_classes=1000, img_size=224, context_dim=64,
@@ -267,7 +259,7 @@ class CFLTransformer(nn.Module):
         return logits
 
     def forward(self, x, T=0):
-        x_emb = self.patch_embed(x)  # [B, seq_len, embed_dim]
+        x_emb = self.patch_embed(x)
         if T <= 0:
             return self.transformer(x_emb)
         else:
@@ -289,14 +281,15 @@ class CFLTransformer(nn.Module):
 
 
 # -----------------------------------------------------------------------------
-# 5. Train & Evaluate
+# 5. Train & Evaluate (with tqdm)
 # -----------------------------------------------------------------------------
 def train_one_epoch(model, loader, optimizer, device, epoch, rank=0):
     model.train()
     total_loss = 0.0
     total_count = 0
 
-    for images, labels in loader:
+    loop = tqdm(loader, desc=f"Epoch {epoch+1} [Train]", disable=(rank!=0))
+    for images, labels in loop:
         images, labels = images.to(device), labels.to(device)
         optimizer.zero_grad()
 
@@ -317,8 +310,10 @@ def evaluate(model, loader, device, T=0, rank=0):
     model.eval()
     correct_top1 = 0
     total = 0
+
+    loop = tqdm(loader, desc=f"Validation T={T}", disable=(rank!=0))
     with torch.no_grad():
-        for images, labels in loader:
+        for images, labels in loop:
             images, labels = images.to(device), labels.to(device)
             logits = model(images, T=T)
             preds = torch.argmax(logits, dim=1)
@@ -335,53 +330,49 @@ def evaluate(model, loader, device, T=0, rank=0):
 # 6. Saliency
 # -----------------------------------------------------------------------------
 def compute_saliency(model, images, device, T=0):
-    """
-    We'll use the max logit as the target for saliency.
-    The returned sal_map is shape (B,1,H,W).
-    """
     def forward_fn(x):
         out = model(x, T=T)
-        preds = out.argmax(dim=1)  # predicted class index
+        preds = out.argmax(dim=1)
         pred_logits = out[range(len(preds)), preds]
         return pred_logits
 
     sal_method = Saliency(forward_fn)
     images.requires_grad = True
     attributions = sal_method.attribute(images, target=None)
-    sal_map = attributions.abs().mean(dim=1, keepdim=True)  # shape (B,1,H,W)
+    sal_map = attributions.abs().mean(dim=1, keepdim=True)
     return sal_map.detach()
 
 
 # -----------------------------------------------------------------------------
-# 7. Main (DDP-Style)
+# 7. Main (DDP-Style) - Updated to use environment variables
 # -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--local_rank", type=int, default=0, help="DDP local rank, set by launch utility.")
-    parser.add_argument("--epochs", type=int, default=15, help="Number of training epochs (demo).")
+    parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
-    parser.add_argument("--world_size", type=int, default=8, help="Total number of processes.")
     args = parser.parse_args()
 
-    # 1) Initialize Process Group
-    dist.init_process_group(backend="nccl", init_method="env://")
-    rank = dist.get_rank()
-    world_size = dist.get_world_size()
+    # If your ImageNet is in /data/jacob/ImageNet with train/ and val/ subfolders,
+    # we set that as the root. This code expects 1000 classes in there.
+    imagenet_root = "/data/jacob/ImageNet"
 
-    # 2) Set device for this rank
-    torch.cuda.set_device(args.local_rank)
-    device = torch.device("cuda", args.local_rank)
-    if rank == 0:
-        print(f"DDP training on rank {rank}, world_size={world_size}, device={device}.")
+    # Read local/global ranks and world_size from environment variables
+    # that are set by torchrun or torch.distributed.launch
+    local_rank = int(os.environ["LOCAL_RANK"])
+    rank = int(os.environ["RANK"])
+    world_size = int(os.environ["WORLD_SIZE"])
 
-    # 3) Create DataLoaders with DistributedSampler
-    train_dir = "/data/jacob/ImageNet/train"
-    val_dir   = "/data/jacob/ImageNet/val"
+    dist.init_process_group(backend="nccl", init_method="env://",
+                            world_size=world_size, rank=rank)
 
+    # Assign the current process to its own GPU
+    torch.cuda.set_device(local_rank)
+    device = torch.device("cuda", local_rank)
+
+    # Build DataLoaders in distributed mode
     train_loader, val_loader = get_imagenet_loaders(
-        train_dir=train_dir,
-        val_dir=val_dir,
+        root=imagenet_root,
         batch_size=args.batch_size,
         num_workers=8,
         distributed=True,
@@ -389,7 +380,7 @@ def main():
         rank=rank
     )
 
-    # 4) Build Model and Wrap with DDP
+    # Hard-code 1000 classes for standard ImageNet
     model = CFLTransformer(
         patch_size=16,
         embed_dim=192,
@@ -403,96 +394,81 @@ def main():
         dropout=0.1
     ).to(device)
 
-    # Wrap the model for DDP
-    model = DDP(model, device_ids=[args.local_rank], output_device=args.local_rank)
-
+    # Wrap model with DDP; this process uses device = local_rank
+    model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                find_unused_parameters=True)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
-    # 5) Training loop
-    EPOCHS = args.epochs
-    for epoch in range(EPOCHS):
-        # IMPORTANT: If using DistributedSampler, must call .set_epoch() each epoch
+    # Main training loop
+    for epoch in range(args.epochs):
         if isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
 
         _ = train_one_epoch(model, train_loader, optimizer, device, epoch, rank)
         _ = evaluate(model, val_loader, device, T=0, rank=rank)
 
-    # Evaluate at T=0,1,2,3
+    # Evaluate with T=0..3
     if rank == 0:
-        print("Evaluating with T=0,1,2,3 across the entire val set:")
+        print("Evaluating with T=0,1,2,3 on val set:")
     for t_val in [0, 1, 2, 3]:
         _ = evaluate(model, val_loader, device, T=t_val, rank=rank)
 
-    # ----------------------
-    # 6) Overlays (Attention & Saliency) - only rank=0
-    # ----------------------
+    # Example: Generate attention/saliency overlays on a small batch
     if rank == 0:
-        # We'll pick a small batch from val_loader
         sample_iter = iter(val_loader)
         images_batch, labels_batch = next(sample_iter)
-        images_batch, labels_batch = images_batch.to(device), labels_batch.to(device)
+        images_batch = images_batch.to(device)
 
-        # Just take first 4 images for demonstration
+        # We'll just take the first 4 images
         sample_images = images_batch[:4].clone()
-        sample_labels = labels_batch[:4].clone()
 
-        # We'll do T in [0,1,2,3]
         os.makedirs("results", exist_ok=True)
-        ddp_model = model.module  # unwrap DDP for direct method calls
+        # unwrap from DDP
+        ddp_core = model.module  
 
         for t_val in [0, 1, 2, 3]:
-            print(f"[Rank 0] Generating overlays for T={t_val}...")
-
-            # 1) Saliency overlay
-            saliency_maps = compute_saliency(ddp_model, sample_images.clone(), device, T=t_val)
-            saliency_maps = saliency_maps.cpu().numpy()  # (B,1,224,224)
+            saliency_maps = compute_saliency(ddp_core, sample_images.clone(), device, T=t_val)
+            saliency_maps = saliency_maps.cpu().numpy()
 
             for i in range(len(sample_images)):
-                img_np = sample_images[i].clone().cpu().numpy()
-                # shape (3,224,224); normally we might un-normalize for display
-                # For brevity, just clip to [0,1]:
+                img_np = sample_images[i].detach().cpu().numpy()
+                # If images were in [0,1], ensure they’re clipped.
+                # (If normalizing in transforms, you may want to de-normalize for visualization.)
                 img_np = np.clip(img_np, 0, 1)
-                img_np = np.transpose(img_np, (1,2,0))  # (224,224,3)
+                img_np = np.transpose(img_np, (1,2,0))
 
-                sal_map = saliency_maps[i,0]  # (224,224)
+                sal_map = saliency_maps[i,0]
 
                 fig, ax = plt.subplots(figsize=(3,3))
                 ax.imshow(img_np)
                 ax.imshow(sal_map, cmap='bwr', alpha=0.3)
-                ax.set_title(f"SAL idx={i}, T={t_val}")
                 ax.axis('off')
                 plt.savefig(f"results/imagenet_saliency_{i}_T{t_val}.png", dpi=600)
                 plt.close(fig)
 
-            # 2) Attention overlay
-            attn_maps = ddp_model.get_attention_maps(sample_images, T=t_val)
+            attn_maps = ddp_core.get_attention_maps(sample_images, T=t_val)
             if attn_maps is not None:
-                attn_maps_avg = attn_maps.mean(dim=1)  # (B, seq_len, seq_len)
+                attn_maps_avg = attn_maps.mean(dim=1)
 
                 for i in range(len(sample_images)):
                     A = attn_maps_avg[i].detach().cpu().numpy()
-                    # For patch_size=16 => seq_len=196 => shape ~ (14,14)
                     if A.ndim == 1 and A.shape[0] == 196:
                         A = A.reshape(14,14)
 
-                    # Upsample 14x14 => 224x224
                     A_upsampled = cv2.resize(A, (224,224), interpolation=cv2.INTER_LINEAR)
 
-                    # Same image from above
-                    img_np = sample_images[i].clone().cpu().numpy()
+                    img_np = sample_images[i].cpu().numpy()
                     img_np = np.clip(img_np, 0, 1)
-                    img_np = np.transpose(img_np, (1,2,0))  # (224,224,3)
+                    img_np = np.transpose(img_np, (1,2,0))
 
                     fig, ax = plt.subplots(figsize=(3,3))
                     ax.imshow(img_np)
                     ax.imshow(A_upsampled, cmap='bwr', alpha=0.2)
-                    ax.set_title(f"ATTN idx={i}, T={t_val}")
                     ax.axis('off')
                     plt.savefig(f"results/imagenet_attention_{i}_T{t_val}.png", dpi=600)
                     plt.close(fig)
 
-        print("[Rank 0] Done! Overlays saved in ./results")
+        print("Done! Overlays saved in ./results")
 
 
 if __name__ == "__main__":
