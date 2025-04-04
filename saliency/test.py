@@ -35,25 +35,6 @@ def denormalize_for_display(tensor, mean=IMAGENET_MEAN, std=IMAGENET_STD):
         denorm[:, c] = denorm[:, c] * std[c] + mean[c]
     return torch.clamp(denorm, 0, 1)
 
-def compute_saliency(model, images, device, T=0):
-    """
-    Return pixel-level saliency wrt each image's predicted class.
-    shape => (B,1,H,W).
-    """
-    model.eval()
-
-    def forward_fn(x):
-        out = model(x, T=T)  # (B, #classes)
-        preds = out.argmax(dim=1)  # top-1 class idx
-        return out[range(len(preds)), preds]
-
-    images_for_grad = images.clone().requires_grad_(True)
-    sal_method = Saliency(forward_fn)
-    attributions = sal_method.attribute(images_for_grad, target=None)
-    # Combine absolute grads over RGB => single-channel
-    sal_map = attributions.abs().mean(dim=1, keepdim=True)  # => (B,1,H,W)
-    return sal_map.detach()
-
 class TransformerEncoderLayerWithAttn(nn.Module):
     def __init__(self, d_model, nhead, dim_feedforward=768, dropout=0.1,
                  activation="relu", batch_first=True):
@@ -304,26 +285,6 @@ def main():
                 # Forward for the given T
                 logits = model(image_tensor, T=T_val)
                 pred_cls = logits.argmax(dim=1).item()
-
-                # -----------------
-                # Saliency
-                # -----------------
-                sal_maps = compute_saliency(model, image_tensor, device, T=T_val)  # (1,1,H,W)
-                s_map = sal_maps[0,0].cpu().numpy()
-
-                # Plot & save saliency overlay
-                fig_s, ax_s = plt.subplots(figsize=(4,4))
-                ax_s.imshow(vis_img_np)
-                ax_s.imshow(s_map, cmap="jet", alpha=0.4,
-                            extent=[0, vis_img_np.shape[1], vis_img_np.shape[0], 0])
-                ax_s.axis("off")
-                sal_out_path = os.path.join(
-                    output_dir,
-                    f"idx_{idx}_label_{label}_pred_{pred_cls}_T{T_val}_sal.png"
-                )
-                plt.savefig(sal_out_path, dpi=600, bbox_inches="tight", pad_inches=0)
-                plt.close(fig_s)
-
                 # -----------------
                 # Attention
                 # -----------------
