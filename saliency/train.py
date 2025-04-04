@@ -24,6 +24,24 @@ from tqdm import tqdm
 
 
 # -----------------------------------------------------------------------------
+# 0. Optional: Denormalization for Visualization
+# -----------------------------------------------------------------------------
+IMAGENET_MEAN = [0.485, 0.456, 0.406]
+IMAGENET_STD  = [0.229, 0.224, 0.225]
+
+def denormalize_for_display(tensor, mean=IMAGENET_MEAN, std=IMAGENET_STD):
+    """
+    Given a batch of images normalized by ImageNet mean & std,
+    denormalize them for more natural visualization.
+    Tensor shape is (B, C, H, W).
+    """
+    denorm = tensor.clone()
+    for c in range(3):
+        denorm[:, c] = denorm[:, c] * std[c] + mean[c]
+    return torch.clamp(denorm, 0, 1)
+
+
+# -----------------------------------------------------------------------------
 # 1. Data
 # -----------------------------------------------------------------------------
 def get_imagenet_loaders(
@@ -193,6 +211,10 @@ class SimpleTransformerEncoder(nn.Module):
         return logits
 
     def get_last_layer_attention(self, x):
+        """
+        Returns the attention weights from the last layer only,
+        plus the final hidden states.
+        """
         B, N, E = x.shape
         x = x + self.pos_embedding[:, :N, :]
 
@@ -266,6 +288,9 @@ class CFLTransformer(nn.Module):
             return self.forward_cfl(x_emb, T=T)
 
     def get_attention_maps(self, x, T=0):
+        """
+        Returns the last-layer attention maps after T iterations of feedback (if T>0).
+        """
         x_emb = self.patch_embed(x)
         if T <= 0:
             attn_weights, _ = self.transformer.get_last_layer_attention(x_emb)
@@ -276,6 +301,7 @@ class CFLTransformer(nn.Module):
             z_t = self.projector(logits)
             h_t = self.feedback_adapter(h_t, z_t)
             logits, h_t = self.forward_once(h_t)
+
         attn_weights, _ = self.transformer.get_last_layer_attention(h_t)
         return attn_weights
 
@@ -287,6 +313,7 @@ def train_one_epoch(model, loader, optimizer, device, epoch, rank=0):
     model.train()
     total_loss = 0.0
     total_count = 0
+    correct_top1 = 0
 
     loop = tqdm(loader, desc=f"Epoch {epoch+1} [Train]", disable=(rank!=0))
     for images, labels in loop:
@@ -298,15 +325,21 @@ def train_one_epoch(model, loader, optimizer, device, epoch, rank=0):
         loss.backward()
         optimizer.step()
 
+        # Track stats
         total_loss += loss.item() * images.size(0)
         total_count += images.size(0)
+        preds = torch.argmax(logits, dim=1)
+        correct_top1 += (preds == labels).sum().item()
 
     avg_loss = total_loss / total_count
+    train_acc = 100.0 * correct_top1 / total_count
     if rank == 0:
-        print(f"[Epoch {epoch+1}] Train Loss: {avg_loss:.4f}")
-    return avg_loss
+        print(f"[Epoch {epoch+1}] Train Loss: {avg_loss:.4f}, "
+              f"Train Acc: {train_acc:.2f}%")
+    return avg_loss, train_acc
 
-def evaluate(model, loader, device, T=0, rank=0):
+
+def evaluate(model, loader, device, T=0, rank=0, epoch=None):
     model.eval()
     correct_top1 = 0
     total = 0
@@ -322,7 +355,10 @@ def evaluate(model, loader, device, T=0, rank=0):
 
     top1 = 100.0 * correct_top1 / total
     if rank == 0:
-        print(f"Val Accuracy @T={T}: {top1:.2f}%")
+        if epoch is not None:
+            print(f"[Epoch {epoch+1}] Val Accuracy (T={T}): {top1:.2f}%")
+        else:
+            print(f"Val Accuracy (T={T}): {top1:.2f}%")
     return top1
 
 
@@ -330,25 +366,37 @@ def evaluate(model, loader, device, T=0, rank=0):
 # 6. Saliency
 # -----------------------------------------------------------------------------
 def compute_saliency(model, images, device, T=0):
+    """
+    Computes the saliency maps w.r.t. the predicted class (by default).
+    If you'd rather target the ground-truth class, you'd pass in labels and
+    modify the forward_fn accordingly.
+    """
+    model.eval()
+
+    # Define a forward function for Captum that returns the logits for each image's
+    # predicted class. In other words, we pick out the logit for the top-1 prediction.
     def forward_fn(x):
-        out = model(x, T=T)
-        preds = out.argmax(dim=1)
+        out = model(x, T=T)          # shape: (B, #classes)
+        preds = out.argmax(dim=1)    # shape: (B,)
+        # We select the corresponding logit for each predicted class:
         pred_logits = out[range(len(preds)), preds]
         return pred_logits
 
+    # Make sure we allow gradient computation on the input images
+    images = images.clone().requires_grad_(True)
+
     sal_method = Saliency(forward_fn)
-    images.requires_grad = True
     attributions = sal_method.attribute(images, target=None)
-    sal_map = attributions.abs().mean(dim=1, keepdim=True)
+    sal_map = attributions.abs().mean(dim=1, keepdim=True)  # shape: (B,1,H,W)
     return sal_map.detach()
 
 
 # -----------------------------------------------------------------------------
-# 7. Main (DDP-Style) - Updated to use environment variables
+# 7. Main (DDP-Style) - Updated with best model saving & more prints
 # -----------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--epochs", type=int, default=1)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-4)
     args = parser.parse_args()
@@ -399,15 +447,23 @@ def main():
                 find_unused_parameters=True)
     optimizer = optim.Adam(model.parameters(), lr=args.lr)
 
+    best_val_acc = 0.0
+
     # Main training loop
     for epoch in range(args.epochs):
         if isinstance(train_loader.sampler, DistributedSampler):
             train_loader.sampler.set_epoch(epoch)
 
-        _ = train_one_epoch(model, train_loader, optimizer, device, epoch, rank)
-        _ = evaluate(model, val_loader, device, T=0, rank=rank)
+        train_loss, train_acc = train_one_epoch(model, train_loader, optimizer, device, epoch, rank)
+        val_acc = evaluate(model, val_loader, device, T=0, rank=rank, epoch=epoch)
 
-    # Evaluate with T=0..3
+        # Save the best model so far (only on rank=0 to avoid race conditions)
+        if rank == 0 and val_acc > best_val_acc:
+            best_val_acc = val_acc
+            torch.save(model.module.state_dict(), "best_model.pth")
+            print(f"New best model saved with Val Accuracy: {best_val_acc:.2f}%")
+
+    # Evaluate with T=0..3 after training
     if rank == 0:
         print("Evaluating with T=0,1,2,3 on val set:")
     for t_val in [0, 1, 2, 3]:
@@ -424,48 +480,57 @@ def main():
 
         os.makedirs("results", exist_ok=True)
         # unwrap from DDP
-        ddp_core = model.module  
+        ddp_core = model.module
+        ddp_core.eval()
+
+        # Optionally denormalize for display
+        sample_images_for_viz = denormalize_for_display(sample_images.clone())
 
         for t_val in [0, 1, 2, 3]:
+            # -- Saliency --
             saliency_maps = compute_saliency(ddp_core, sample_images.clone(), device, T=t_val)
             saliency_maps = saliency_maps.cpu().numpy()
 
             for i in range(len(sample_images)):
-                img_np = sample_images[i].detach().cpu().numpy()
-                # If images were in [0,1], ensure they’re clipped.
-                # (If normalizing in transforms, you may want to de-normalize for visualization.)
-                img_np = np.clip(img_np, 0, 1)
+                # Denormalized image for visualization
+                img_np = sample_images_for_viz[i].cpu().numpy()
                 img_np = np.transpose(img_np, (1,2,0))
 
-                sal_map = saliency_maps[i,0]
+                sal_map = saliency_maps[i,0]  # shape: (H, W)
 
                 fig, ax = plt.subplots(figsize=(3,3))
                 ax.imshow(img_np)
                 ax.imshow(sal_map, cmap='bwr', alpha=0.3)
                 ax.axis('off')
-                plt.savefig(f"results/imagenet_saliency_{i}_T{t_val}.png", dpi=600)
+                plt.savefig(f"results/imagenet_saliency_{i}_T{t_val}.png", dpi=300)
                 plt.close(fig)
 
+            # -- Attention --
             attn_maps = ddp_core.get_attention_maps(sample_images, T=t_val)
+
             if attn_maps is not None:
-                attn_maps_avg = attn_maps.mean(dim=1)
+                # attn_maps shape: (B, num_heads, N, N), typically (B, 4, 196, 196)
+                # We'll average over heads and also over the 'query' dimension
+                # so that we get a single 1D vector per patch (length N=196).
+                attn_maps_avg = attn_maps.mean(dim=(1,2))  # shape: (B, N=196)
 
                 for i in range(len(sample_images)):
-                    A = attn_maps_avg[i].detach().cpu().numpy()
-                    if A.ndim == 1 and A.shape[0] == 196:
-                        A = A.reshape(14,14)
+                    A = attn_maps_avg[i].detach().cpu().numpy()  # shape (196,)
+                    # Reshape to 14 x 14
+                    A = A.reshape(14, 14)
 
+                    # Upsample to 224 x 224
                     A_upsampled = cv2.resize(A, (224,224), interpolation=cv2.INTER_LINEAR)
 
-                    img_np = sample_images[i].cpu().numpy()
-                    img_np = np.clip(img_np, 0, 1)
+                    # Denormalized image for visualization
+                    img_np = sample_images_for_viz[i].cpu().numpy()
                     img_np = np.transpose(img_np, (1,2,0))
 
                     fig, ax = plt.subplots(figsize=(3,3))
                     ax.imshow(img_np)
-                    ax.imshow(A_upsampled, cmap='bwr', alpha=0.2)
+                    ax.imshow(A_upsampled, cmap='bwr', alpha=0.3)
                     ax.axis('off')
-                    plt.savefig(f"results/imagenet_attention_{i}_T{t_val}.png", dpi=600)
+                    plt.savefig(f"results/imagenet_attention_{i}_T{t_val}.png", dpi=300)
                     plt.close(fig)
 
         print("Done! Overlays saved in ./results")
